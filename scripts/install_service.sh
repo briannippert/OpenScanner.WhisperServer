@@ -25,7 +25,8 @@ log_error() { echo -e "${RED}[ERROR] $1${NC}"; }
 
 # Parse Arguments
 DEPS_ONLY=false
-PORT=8090
+REBUILD_WHISPER=false
+PORT=""
 for arg in "$@"; do
   case $arg in
     --deps-only)
@@ -34,6 +35,10 @@ for arg in "$@"; do
       ;;
     --port=*)
       PORT="${arg#*=}"
+      shift
+      ;;
+    --rebuild-whisper)
+      REBUILD_WHISPER=true
       shift
       ;;
   esac
@@ -165,6 +170,20 @@ esac
 log_info "Using model: $WHISPER_MODEL"
 
 # ----------------------------------------------------------------
+# 5b. Port Selection
+# ----------------------------------------------------------------
+if [ -z "$PORT" ]; then
+    CURRENT_PORT=$(jq -r '.Urls // empty' "$APPSETTINGS" 2>/dev/null | grep -oP ':\K[0-9]+' || echo "8090")
+    [ -z "$CURRENT_PORT" ] && CURRENT_PORT="8090"
+
+    echo ""
+    read -r -p "$(echo -e "${BLUE}[INFO]${NC} Port to run the server on (press Enter to keep ${BOLD}$CURRENT_PORT${NC}): ")" PORT_CHOICE
+    PORT="${PORT_CHOICE:-$CURRENT_PORT}"
+fi
+
+log_info "Using port: $PORT"
+
+# ----------------------------------------------------------------
 # 6. Whisper.cpp Setup
 # ----------------------------------------------------------------
 log_step "Checking Whisper.cpp..."
@@ -176,10 +195,34 @@ if [ ! -d "$WHISPER_DIR" ]; then
     git clone https://github.com/ggerganov/whisper.cpp.git "$WHISPER_DIR"
 fi
 
+# Detect NVIDIA GPU for CUDA acceleration
+CMAKE_EXTRA_ARGS=""
+if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+    log_success "NVIDIA GPU detected: $GPU_NAME"
+
+    if command -v nvcc &> /dev/null; then
+        log_info "CUDA toolkit found. Enabling GPU acceleration."
+        CMAKE_EXTRA_ARGS="-DGGML_CUDA=ON"
+    else
+        log_warn "NVIDIA GPU detected but CUDA toolkit (nvcc) not found."
+        log_info "Install the CUDA toolkit for GPU acceleration:"
+        log_info "  sudo apt-get install nvidia-cuda-toolkit"
+        log_info "Falling back to CPU-only build."
+    fi
+else
+    log_info "No NVIDIA GPU detected. Using CPU-only build."
+fi
+
+if [ "$REBUILD_WHISPER" = true ] && [ -d "$WHISPER_DIR/build" ]; then
+    log_info "Removing existing whisper.cpp build (--rebuild-whisper)..."
+    rm -rf "$WHISPER_DIR/build"
+fi
+
 if [ ! -f "$WHISPER_DIR/build/bin/whisper-cli" ]; then
-    log_info "Building whisper.cpp..."
+    log_info "Building whisper.cpp${CMAKE_EXTRA_ARGS:+ (with CUDA)}..."
     cd "$WHISPER_DIR"
-    cmake -B build
+    cmake -B build $CMAKE_EXTRA_ARGS
     cmake --build build --config Release -j$(nproc)
     log_success "Whisper.cpp built."
 fi

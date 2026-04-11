@@ -20,15 +20,17 @@ chmod +x scripts/*.sh
 The installer will:
 1. Install system dependencies (.NET 10 SDK, cmake, ffmpeg)
 2. Prompt you to select a Whisper model
-3. Clone and build whisper.cpp
-4. Download your chosen model
-5. Build the .NET server
-6. Configure and start a systemd service on port 8090
+3. Prompt you to choose a port (default: 8090)
+4. Clone and build whisper.cpp (with CUDA if an NVIDIA GPU is detected)
+5. Download your chosen model
+6. Build the .NET server
+7. Configure and start a systemd service
 
 ### Installer Options
 
 - `--deps-only`: Install dependencies and download the model, then exit without building or installing the service
-- `--port=NNNN`: Set the listening port (default: 8090)
+- `--port=NNNN`: Set the listening port (skips the interactive prompt)
+- `--rebuild-whisper`: Force a clean rebuild of whisper.cpp (useful after installing CUDA)
 
 ```bash
 # Install deps only
@@ -36,7 +38,15 @@ The installer will:
 
 # Use a custom port
 ./scripts/install_service.sh --port=9000
+
+# Rebuild whisper.cpp with GPU support after installing CUDA toolkit
+sudo apt-get install nvidia-cuda-toolkit
+./scripts/install_service.sh --rebuild-whisper
 ```
+
+### GPU Acceleration
+
+The installer automatically detects NVIDIA GPUs and enables CUDA acceleration when the CUDA toolkit is installed. If you install the CUDA toolkit after the initial setup, re-run the installer with `--rebuild-whisper` to recompile whisper.cpp with GPU support.
 
 ### Uninstall
 
@@ -59,7 +69,13 @@ If you prefer to set things up manually:
 ```bash
 git clone https://github.com/ggerganov/whisper.cpp.git
 cd whisper.cpp
+
+# CPU-only build
 cmake -B build
+cmake --build build --config Release
+
+# Or with CUDA for GPU acceleration (requires nvidia-cuda-toolkit)
+cmake -B build -DGGML_CUDA=ON
 cmake --build build --config Release
 
 # Download a model
