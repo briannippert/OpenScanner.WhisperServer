@@ -30,6 +30,7 @@ public class WhisperService
     public string WhisperXScript => _config["Whisper:WhisperXScript"]
         ?? Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "scripts", "whisperx_transcribe.py");
     public string PythonBinary => _config["Whisper:PythonBinary"] ?? "python3";
+    public string ComputeType => _config["Whisper:ComputeType"] ?? "auto";
 
     public HardwareInfo Hardware => _hardwareInfo.Value;
     public bool IsDiarizationAvailable => _whisperXAvailable.Value && !string.IsNullOrEmpty(HuggingFaceToken);
@@ -150,7 +151,7 @@ public class WhisperService
             return null;
         }
 
-        var args = $"\"{scriptPath}\" \"{wavPath}\" --model \"{ModelName}\" --hf-token \"{HuggingFaceToken}\" --language en";
+        var args = $"\"{scriptPath}\" \"{wavPath}\" --model \"{ModelName}\" --hf-token \"{HuggingFaceToken}\" --language en --compute-type \"{ComputeType}\"";
         if (!string.IsNullOrEmpty(prompt))
             args += $" --prompt \"{prompt}\"";
 

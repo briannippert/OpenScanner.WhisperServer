@@ -25,6 +25,8 @@ def main():
     parser.add_argument("--hf-token", required=True, help="HuggingFace token for pyannote diarization models")
     parser.add_argument("--language", default="en", help="Language code (default: en)")
     parser.add_argument("--prompt", default="", help="Initial prompt for transcription context")
+    parser.add_argument("--compute-type", default="auto",
+                        help="CTranslate2 compute type: auto, int8, float16, float32 (default: auto)")
     args = parser.parse_args()
 
     try:
@@ -36,7 +38,9 @@ def main():
         else:
             device = args.device
 
-        compute_type = "float16" if device == "cuda" else "float32"
+        compute_type = args.compute_type
+        if compute_type == "auto":
+            compute_type = "int8" if device == "cuda" else "float32"
 
         # 1. Transcribe
         model = whisperx.load_model(
