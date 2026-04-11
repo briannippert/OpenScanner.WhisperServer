@@ -3,8 +3,17 @@ using OpenScanner.WhisperServer.Services;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSingleton<WhisperService>();
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+        policy.AllowAnyOrigin()
+              .AllowAnyMethod()
+              .AllowAnyHeader());
+});
 
 var app = builder.Build();
+
+app.UseCors();
 
 app.MapGet("/health", (WhisperService whisper) =>
 {
