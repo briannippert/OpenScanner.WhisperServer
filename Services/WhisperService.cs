@@ -151,7 +151,36 @@ public class WhisperService
             // nvidia-smi not available
         }
 
+        info.WhisperCudaEnabled = CheckWhisperCudaLinked();
+
         return info;
+    }
+
+    private bool CheckWhisperCudaLinked()
+    {
+        try
+        {
+            if (!File.Exists(WhisperBinary) || !RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+                return false;
+
+            var psi = new ProcessStartInfo("ldd", WhisperBinary)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi);
+            if (proc == null) return false;
+
+            var output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit(3000);
+            return proc.ExitCode == 0 && output.Contains("libcuda", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static string GetCpuName()
@@ -180,5 +209,6 @@ public class HardwareInfo
     public string? Gpu { get; set; }
     public int? GpuMemoryMb { get; set; }
     public bool CudaAvailable { get; set; }
-    public string AccelerationMode => CudaAvailable ? "GPU (CUDA)" : "CPU";
+    public bool WhisperCudaEnabled { get; set; }
+    public string AccelerationMode => WhisperCudaEnabled ? "GPU (CUDA)" : CudaAvailable ? "GPU available but not enabled" : "CPU";
 }

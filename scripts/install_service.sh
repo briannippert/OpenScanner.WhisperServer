@@ -228,6 +228,15 @@ if [ "$REBUILD_WHISPER" = true ] && [ -d "$WHISPER_DIR/build" ]; then
     rm -rf "$WHISPER_DIR/build"
 fi
 
+# Auto-detect CUDA mismatch: GPU available but binary built without CUDA
+if [ -f "$WHISPER_DIR/build/bin/whisper-cli" ] && [ -n "$CMAKE_EXTRA_ARGS" ]; then
+    if ! ldd "$WHISPER_DIR/build/bin/whisper-cli" 2>/dev/null | grep -q 'libcuda'; then
+        log_warn "Existing whisper-cli was built without CUDA, but GPU acceleration is available."
+        log_info "Rebuilding whisper.cpp with CUDA support..."
+        rm -rf "$WHISPER_DIR/build"
+    fi
+fi
+
 if [ ! -f "$WHISPER_DIR/build/bin/whisper-cli" ]; then
     log_info "Building whisper.cpp${CMAKE_EXTRA_ARGS:+ (with CUDA)}..."
     cd "$WHISPER_DIR"
