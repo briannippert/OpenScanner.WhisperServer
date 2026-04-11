@@ -260,6 +260,9 @@ cd "$PROJECT_ROOT"
 log_step "Speaker Diarization Setup (WhisperX)"
 
 CURRENT_HF_TOKEN=$(jq -r '.Whisper.HuggingFaceToken // ""' "$APPSETTINGS" 2>/dev/null || echo "")
+if [ -z "$CURRENT_HF_TOKEN" ] && [ -f "$HOME/.cache/huggingface/token" ]; then
+    CURRENT_HF_TOKEN=$(cat "$HOME/.cache/huggingface/token" 2>/dev/null || echo "")
+fi
 
 echo ""
 echo -e "  WhisperX enables speaker diarization -- identifying who is"
@@ -278,11 +281,18 @@ if [ -n "$CURRENT_HF_TOKEN" ]; then
     echo ""
 fi
 
-read -r -p "$(echo -e "${BLUE}[INFO]${NC} Enter your HuggingFace token (press Enter to ${BOLD}skip${NC} diarization): ")" HF_TOKEN_INPUT
+read -r -p "$(echo -e "${BLUE}[INFO]${NC} Enter your HuggingFace token (press Enter to ${BOLD}keep existing${NC} or skip): ")" HF_TOKEN_INPUT
 HF_TOKEN="${HF_TOKEN_INPUT:-$CURRENT_HF_TOKEN}"
 
 WHISPERX_VENV="$PROJECT_ROOT/.venv"
 if [ -n "$HF_TOKEN" ]; then
+    # Save token for future use
+    HF_TOKEN_DIR="$HOME/.cache/huggingface"
+    mkdir -p "$HF_TOKEN_DIR"
+    echo "$HF_TOKEN" > "$HF_TOKEN_DIR/token"
+    chmod 600 "$HF_TOKEN_DIR/token"
+    log_info "HuggingFace token saved to $HF_TOKEN_DIR/token"
+
     log_info "Setting up WhisperX..."
 
     # Ensure Python 3.9+ and pip
