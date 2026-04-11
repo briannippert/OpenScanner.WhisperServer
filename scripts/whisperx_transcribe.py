@@ -17,6 +17,36 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
+def _detect_device():
+    """Pick CUDA if available and the GPU architecture is supported, else CPU."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return "cpu"
+
+    try:
+        cap = torch.cuda.get_device_capability()
+        gpu_sm = cap[0] * 10 + cap[1]
+        min_supported = None
+        for arch in torch.cuda.get_arch_list():
+            if arch.startswith("sm_"):
+                sm = int(arch[3:])
+                if min_supported is None or sm < min_supported:
+                    min_supported = sm
+        if min_supported is not None and gpu_sm < min_supported:
+            print(
+                f"GPU compute capability sm_{gpu_sm} is below the minimum "
+                f"supported sm_{min_supported}; falling back to CPU.",
+                file=sys.stderr,
+            )
+            return "cpu"
+        # Quick sanity check — actually allocate on CUDA
+        torch.zeros(1, device="cuda")
+        return "cuda"
+    except RuntimeError:
+        return "cpu"
+
+
 def main():
     parser = argparse.ArgumentParser(description="WhisperX transcription with speaker diarization")
     parser.add_argument("audio", help="Path to audio file")
@@ -34,7 +64,7 @@ def main():
         import whisperx
 
         if args.device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = _detect_device()
         else:
             device = args.device
 
