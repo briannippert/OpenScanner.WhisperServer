@@ -1,0 +1,292 @@
+#!/bin/bash
+set -e
+
+# =====================================================
+# OpenScanner WhisperServer Installer
+# =====================================================
+# Installs system dependencies, builds whisper.cpp,
+# downloads a Whisper model, builds the .NET server,
+# and configures a systemd service.
+# =====================================================
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+BOLD='\033[1m'
+
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_step() { echo -e "\n${BLUE}${BOLD}==> $1${NC}"; }
+log_success() { echo -e "${GREEN}[OK] $1${NC}"; }
+log_warn() { echo -e "${YELLOW}[WARN] $1${NC}"; }
+log_error() { echo -e "${RED}[ERROR] $1${NC}"; }
+
+# Parse Arguments
+DEPS_ONLY=false
+PORT=8090
+for arg in "$@"; do
+  case $arg in
+    --deps-only)
+      DEPS_ONLY=true
+      shift
+      ;;
+    --port=*)
+      PORT="${arg#*=}"
+      shift
+      ;;
+  esac
+done
+
+# Check NOT Root
+if [ "$EUID" -eq 0 ]; then
+  log_error "Please run as a regular user (NOT root)."
+  log_error "The script will ask for sudo password when needed."
+  exit 1
+fi
+
+# Ensure sudo is available
+if ! command -v sudo &> /dev/null; then
+    log_error "This script requires 'sudo' to install system dependencies."
+    exit 1
+fi
+
+# Refresh sudo credentials upfront
+sudo -v
+
+PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+log_step "Initializing Setup"
+log_info "Project Root: $PROJECT_ROOT"
+log_info "User: $USER ($HOME)"
+
+# ----------------------------------------------------------------
+# 1. Stop Existing Service
+# ----------------------------------------------------------------
+log_step "Stopping existing service..."
+if systemctl is-active --quiet openscanner-whisper; then
+    sudo systemctl stop openscanner-whisper
+    log_info "Service stopped."
+else
+    log_info "Service was not running."
+fi
+
+# ----------------------------------------------------------------
+# 2. Update Code
+# ----------------------------------------------------------------
+log_step "Updating Repository..."
+if git remote get-url origin &> /dev/null; then
+    if git pull origin main; then
+        log_success "Code pulled successfully."
+    else
+        log_warn "Git pull failed. Continuing with local files..."
+    fi
+else
+    log_warn "No git remote found. Skipping update."
+fi
+
+# ----------------------------------------------------------------
+# 3. Check .NET SDK
+# ----------------------------------------------------------------
+log_step "Checking Environment..."
+
+INSTALL_DOTNET=false
+if ! command -v dotnet &> /dev/null; then
+    log_info ".NET SDK not found."
+    INSTALL_DOTNET=true
+else
+    DOTNET_VER=$(dotnet --version)
+    MAJOR_VER=$(echo "$DOTNET_VER" | cut -d. -f1)
+    if [ "$MAJOR_VER" -lt 10 ]; then
+        log_info "Found .NET SDK $DOTNET_VER, but .NET 10 is required."
+        INSTALL_DOTNET=true
+    else
+        log_success "Found .NET SDK: $DOTNET_VER"
+    fi
+fi
+
+if [ "$INSTALL_DOTNET" = true ]; then
+    log_info "Attempting to install .NET 10 SDK..."
+
+    if command -v apt-get &> /dev/null; then
+        wget https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb -O packages-microsoft-prod.deb
+        sudo dpkg -i packages-microsoft-prod.deb
+        rm packages-microsoft-prod.deb
+
+        sudo apt-get update -qq || log_warn "apt-get update encountered errors. Attempting to continue..."
+        sudo apt-get install -y -qq dotnet-sdk-10.0
+        log_success ".NET 10 SDK installed."
+    else
+         log_warn "Could not install .NET SDK automatically. Please install .NET 10 SDK manually."
+    fi
+fi
+
+# ----------------------------------------------------------------
+# 4. System Dependencies
+# ----------------------------------------------------------------
+log_step "Installing System Libraries..."
+
+sudo apt-get update -qq || log_warn "apt-get update encountered errors. Attempting to continue..."
+sudo apt-get install -y -qq git cmake build-essential ffmpeg jq > /dev/null
+log_success "Libraries installed."
+
+# ----------------------------------------------------------------
+# 5. Whisper Model Selection
+# ----------------------------------------------------------------
+log_step "Whisper Model Selection"
+
+APPSETTINGS="$PROJECT_ROOT/appsettings.json"
+CURRENT_MODEL=$(jq -r '.Whisper.ModelName // "small.en"' "$APPSETTINGS" 2>/dev/null || echo "small.en")
+
+echo ""
+echo -e "  Available Whisper models (English-only models recommended for radio):"
+echo ""
+echo -e "    ${BOLD}1)${NC} tiny.en      - Fastest, lowest accuracy (~75 MB)"
+echo -e "    ${BOLD}2)${NC} base.en      - Fast, decent accuracy (~150 MB)"
+echo -e "    ${BOLD}3)${NC} small.en     - Good balance of speed and accuracy (~500 MB)"
+echo -e "    ${BOLD}4)${NC} medium.en    - High accuracy, slower (~1.5 GB)"
+echo -e "    ${BOLD}5)${NC} large-v3     - Best accuracy, slowest (~3 GB, multilingual)"
+echo ""
+echo -e "  Current model: ${BOLD}$CURRENT_MODEL${NC}"
+echo ""
+
+read -r -p "$(echo -e "${BLUE}[INFO]${NC} Select a model [1-5] (press Enter to keep ${BOLD}$CURRENT_MODEL${NC}): ")" MODEL_CHOICE
+
+case "$MODEL_CHOICE" in
+    1) WHISPER_MODEL="tiny.en" ;;
+    2) WHISPER_MODEL="base.en" ;;
+    3) WHISPER_MODEL="small.en" ;;
+    4) WHISPER_MODEL="medium.en" ;;
+    5) WHISPER_MODEL="large-v3" ;;
+    *) WHISPER_MODEL="$CURRENT_MODEL" ;;
+esac
+
+log_info "Using model: $WHISPER_MODEL"
+
+# ----------------------------------------------------------------
+# 6. Whisper.cpp Setup
+# ----------------------------------------------------------------
+log_step "Checking Whisper.cpp..."
+
+WHISPER_DIR="$PROJECT_ROOT/whisper.cpp"
+
+if [ ! -d "$WHISPER_DIR" ]; then
+    log_info "Cloning whisper.cpp..."
+    git clone https://github.com/ggerganov/whisper.cpp.git "$WHISPER_DIR"
+fi
+
+if [ ! -f "$WHISPER_DIR/build/bin/whisper-cli" ]; then
+    log_info "Building whisper.cpp..."
+    cd "$WHISPER_DIR"
+    cmake -B build
+    cmake --build build --config Release -j$(nproc)
+    log_success "Whisper.cpp built."
+fi
+
+# Download model
+if [ ! -f "$WHISPER_DIR/models/ggml-$WHISPER_MODEL.bin" ]; then
+    log_info "Downloading Whisper model ($WHISPER_MODEL)..."
+    cd "$WHISPER_DIR"
+    bash ./models/download-ggml-model.sh "$WHISPER_MODEL"
+    log_success "Whisper model downloaded."
+fi
+cd "$PROJECT_ROOT"
+
+# ----------------------------------------------------------------
+# 7. Update appsettings.json with selected model and paths
+# ----------------------------------------------------------------
+log_step "Updating Configuration..."
+
+WHISPER_BIN="$WHISPER_DIR/build/bin/whisper-cli"
+WHISPER_MODEL_PATH="$WHISPER_DIR/models/ggml-$WHISPER_MODEL.bin"
+
+UPDATED=$(jq \
+    --arg bin "$WHISPER_BIN" \
+    --arg modelPath "$WHISPER_MODEL_PATH" \
+    --arg modelName "$WHISPER_MODEL" \
+    '.Whisper.BinaryPath = $bin | .Whisper.ModelPath = $modelPath | .Whisper.ModelName = $modelName' \
+    "$APPSETTINGS")
+echo "$UPDATED" > "$APPSETTINGS"
+
+log_success "Configuration updated:"
+log_info "  Binary:  $WHISPER_BIN"
+log_info "  Model:   $WHISPER_MODEL_PATH"
+
+if [ "$DEPS_ONLY" = true ]; then
+    log_success "Dependencies installed. Skipping build and service installation (--deps-only)."
+    exit 0
+fi
+
+# ----------------------------------------------------------------
+# 8. Build Application
+# ----------------------------------------------------------------
+log_step "Building Application..."
+
+cd "$PROJECT_ROOT"
+if dotnet build -c Release -o bin/Release/net10.0/publish; then
+    log_success "Server built successfully."
+else
+    log_error "Server build failed."
+    exit 1
+fi
+
+# ----------------------------------------------------------------
+# 9. Configure Systemd Service
+# ----------------------------------------------------------------
+log_step "Configuring Systemd Service..."
+
+SERVICE_FILE="/etc/systemd/system/openscanner-whisper.service"
+NET_EXEC="$PROJECT_ROOT/bin/Release/net10.0/publish/OpenScanner.WhisperServer"
+
+chmod +x "$NET_EXEC"
+
+TEMP_SERVICE_FILE=$(mktemp)
+cat <<EOF > "$TEMP_SERVICE_FILE"
+[Unit]
+Description=OpenScanner Whisper Transcription Server
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$PROJECT_ROOT
+ExecStart=$NET_EXEC --urls "http://0.0.0.0:$PORT"
+Restart=always
+RestartSec=5
+Environment=DOTNET_ENVIRONMENT=Production
+Environment=ASPNETCORE_URLS=http://0.0.0.0:$PORT
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo mv "$TEMP_SERVICE_FILE" "$SERVICE_FILE"
+sudo chown root:root "$SERVICE_FILE"
+sudo chmod 644 "$SERVICE_FILE"
+
+sudo systemctl daemon-reload
+sudo systemctl enable openscanner-whisper
+sudo systemctl restart openscanner-whisper
+
+# ----------------------------------------------------------------
+# 10. Finalize
+# ----------------------------------------------------------------
+log_step "Finalizing..."
+chmod +x "$PROJECT_ROOT"/scripts/*.sh
+
+IP_ADDR=$(hostname -I | awk '{print $1}')
+
+echo ""
+echo "================================================="
+log_success "Installation Complete!"
+echo "================================================="
+echo -e "   ${BOLD}Model:${NC}   $WHISPER_MODEL"
+echo -e "   ${BOLD}Port:${NC}    $PORT"
+echo -e "   ${BOLD}Status:${NC}  systemctl status openscanner-whisper"
+echo -e "   ${BOLD}Logs:${NC}    journalctl -u openscanner-whisper -f"
+echo -e "   ${BOLD}Health:${NC}  http://$IP_ADDR:$PORT/health"
+echo ""
+echo -e "   To connect from OpenScanner, set the remote URL to:"
+echo -e "   ${BOLD}http://$IP_ADDR:$PORT${NC}"
+echo "================================================="

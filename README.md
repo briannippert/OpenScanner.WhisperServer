@@ -4,6 +4,52 @@ A lightweight .NET Web API server that provides remote Whisper AI transcription 
 
 ## Prerequisites
 
+- A Linux machine (Ubuntu/Debian recommended) with a GPU or fast CPU
+- The installer handles everything else (.NET SDK, whisper.cpp, model download)
+
+## Quick Start
+
+```bash
+git clone https://github.com/briannippert/OpenScanner.WhisperServer.git
+cd OpenScanner.WhisperServer
+
+chmod +x scripts/*.sh
+./scripts/install_service.sh
+```
+
+The installer will:
+1. Install system dependencies (.NET 10 SDK, cmake, ffmpeg)
+2. Prompt you to select a Whisper model
+3. Clone and build whisper.cpp
+4. Download your chosen model
+5. Build the .NET server
+6. Configure and start a systemd service on port 8090
+
+### Installer Options
+
+- `--deps-only`: Install dependencies and download the model, then exit without building or installing the service
+- `--port=NNNN`: Set the listening port (default: 8090)
+
+```bash
+# Install deps only
+./scripts/install_service.sh --deps-only
+
+# Use a custom port
+./scripts/install_service.sh --port=9000
+```
+
+### Uninstall
+
+```bash
+./scripts/uninstall_service.sh
+```
+
+## Manual Setup
+
+If you prefer to set things up manually:
+
+### Prerequisites (Manual)
+
 - [.NET 10 SDK](https://dotnet.microsoft.com/download)
 - [whisper.cpp](https://github.com/ggerganov/whisper.cpp) built with `whisper-cli`
 - A Whisper model file (e.g., `ggml-small.en.bin`)
@@ -22,7 +68,7 @@ bash models/download-ggml-model.sh small.en
 
 ## Configuration
 
-Edit `appsettings.json` to point to your whisper.cpp installation:
+Edit `appsettings.json` to point to your whisper.cpp installation (the installer does this automatically):
 
 ```json
 {
@@ -43,6 +89,15 @@ export Whisper__ModelPath=/path/to/ggml-small.en.bin
 ```
 
 ## Running
+
+If installed via the installer, the server runs as a systemd service:
+
+```bash
+systemctl status openscanner-whisper    # Check status
+journalctl -u openscanner-whisper -f    # View logs
+```
+
+To run manually instead:
 
 ```bash
 dotnet run
@@ -94,6 +149,14 @@ Response:
 Parameters:
 - `file` (required): WAV audio file
 - `prompt` (optional): Context prompt to guide transcription accuracy. If omitted, the default radio-context prompt from config is used.
+
+## Updating
+
+Re-run the installer to pull the latest code, rebuild, and restart:
+
+```bash
+./scripts/install_service.sh
+```
 
 ## Connecting to OpenScanner
 
