@@ -1,0 +1,27 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.dll
+*.exe
+*.pdb
+*.nupkg
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*~
+
+# Build
+publish/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp audio files
+*.16k.wav
