@@ -9,6 +9,10 @@ obj/
 *.pdb
 *.nupkg
 
+# Python venv
+.venv/
+__pycache__/
+
 # IDE
 .vs/
 .vscode/

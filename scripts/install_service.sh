@@ -255,24 +255,92 @@ fi
 cd "$PROJECT_ROOT"
 
 # ----------------------------------------------------------------
-# 7. Update appsettings.json with selected model and paths
+# 7. WhisperX Speaker Diarization (Optional)
+# ----------------------------------------------------------------
+log_step "Speaker Diarization Setup (WhisperX)"
+
+CURRENT_HF_TOKEN=$(jq -r '.Whisper.HuggingFaceToken // ""' "$APPSETTINGS" 2>/dev/null || echo "")
+
+echo ""
+echo -e "  WhisperX enables speaker diarization -- identifying who is"
+echo -e "  speaking in each part of a radio transmission."
+echo ""
+echo -e "  ${BOLD}Requirements:${NC}"
+echo -e "    - Python 3.9+ with pip"
+echo -e "    - A HuggingFace account and access token"
+echo -e "    - Accept the pyannote model license at:"
+echo -e "      ${BLUE}https://huggingface.co/pyannote/speaker-diarization-3.1${NC}"
+echo -e "      ${BLUE}https://huggingface.co/pyannote/segmentation-3.0${NC}"
+echo ""
+
+if [ -n "$CURRENT_HF_TOKEN" ]; then
+    echo -e "  Current token: ${BOLD}${CURRENT_HF_TOKEN:0:8}...${NC}"
+    echo ""
+fi
+
+read -r -p "$(echo -e "${BLUE}[INFO]${NC} Enter your HuggingFace token (press Enter to ${BOLD}skip${NC} diarization): ")" HF_TOKEN_INPUT
+HF_TOKEN="${HF_TOKEN_INPUT:-$CURRENT_HF_TOKEN}"
+
+WHISPERX_VENV="$PROJECT_ROOT/.venv"
+if [ -n "$HF_TOKEN" ]; then
+    log_info "Setting up WhisperX..."
+
+    # Ensure Python 3.9+ and pip
+    if ! command -v python3 &> /dev/null; then
+        log_info "Installing Python 3..."
+        sudo apt-get install -y -qq python3 python3-pip python3-venv > /dev/null
+    fi
+
+    PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)
+    log_info "Found Python $PYTHON_VER"
+
+    if [ ! -d "$WHISPERX_VENV" ]; then
+        log_info "Creating Python virtual environment..."
+        python3 -m venv "$WHISPERX_VENV"
+    fi
+
+    log_info "Installing WhisperX (this may take several minutes)..."
+    "$WHISPERX_VENV/bin/pip" install --quiet --upgrade pip
+    "$WHISPERX_VENV/bin/pip" install --quiet whisperx
+
+    if "$WHISPERX_VENV/bin/python" -c "import whisperx; print('ok')" 2>/dev/null | grep -q "ok"; then
+        log_success "WhisperX installed successfully."
+    else
+        log_warn "WhisperX installation may have issues. Diarization might not work."
+    fi
+else
+    log_info "Skipping WhisperX setup (no HuggingFace token provided)."
+fi
+
+# ----------------------------------------------------------------
+# 8. Update appsettings.json with selected model and paths
 # ----------------------------------------------------------------
 log_step "Updating Configuration..."
 
 WHISPER_BIN="$WHISPER_DIR/build/bin/whisper-cli"
 WHISPER_MODEL_PATH="$WHISPER_DIR/models/ggml-$WHISPER_MODEL.bin"
+PYTHON_BIN="${WHISPERX_VENV}/bin/python"
+WHISPERX_SCRIPT="$PROJECT_ROOT/scripts/whisperx_transcribe.py"
 
 UPDATED=$(jq \
     --arg bin "$WHISPER_BIN" \
     --arg modelPath "$WHISPER_MODEL_PATH" \
     --arg modelName "$WHISPER_MODEL" \
-    '.Whisper.BinaryPath = $bin | .Whisper.ModelPath = $modelPath | .Whisper.ModelName = $modelName' \
+    --arg hfToken "$HF_TOKEN" \
+    --arg pythonBin "$PYTHON_BIN" \
+    --arg wxScript "$WHISPERX_SCRIPT" \
+    '.Whisper.BinaryPath = $bin | .Whisper.ModelPath = $modelPath | .Whisper.ModelName = $modelName | .Whisper.HuggingFaceToken = $hfToken | .Whisper.PythonBinary = $pythonBin | .Whisper.WhisperXScript = $wxScript' \
     "$APPSETTINGS")
 echo "$UPDATED" > "$APPSETTINGS"
 
 log_success "Configuration updated:"
-log_info "  Binary:  $WHISPER_BIN"
-log_info "  Model:   $WHISPER_MODEL_PATH"
+log_info "  Binary:      $WHISPER_BIN"
+log_info "  Model:       $WHISPER_MODEL_PATH"
+if [ -n "$HF_TOKEN" ]; then
+    log_info "  Diarization: Enabled (WhisperX)"
+else
+    log_info "  Diarization: Disabled (no HuggingFace token)"
+fi
 
 if [ "$DEPS_ONLY" = true ]; then
     log_success "Dependencies installed. Skipping build and service installation (--deps-only)."
@@ -280,7 +348,7 @@ if [ "$DEPS_ONLY" = true ]; then
 fi
 
 # ----------------------------------------------------------------
-# 8. Build Application
+# 9. Build Application
 # ----------------------------------------------------------------
 log_step "Building Application..."
 
@@ -293,7 +361,7 @@ else
 fi
 
 # ----------------------------------------------------------------
-# 9. Configure Systemd Service
+# 10. Configure Systemd Service
 # ----------------------------------------------------------------
 log_step "Configuring Systemd Service..."
 
@@ -331,7 +399,7 @@ sudo systemctl enable openscanner-whisper
 sudo systemctl restart openscanner-whisper
 
 # ----------------------------------------------------------------
-# 10. Finalize
+# 11. Finalize
 # ----------------------------------------------------------------
 log_step "Finalizing..."
 chmod +x "$PROJECT_ROOT"/scripts/*.sh

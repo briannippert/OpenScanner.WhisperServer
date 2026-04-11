@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 
 namespace OpenScanner.WhisperServer.Services;
 
@@ -9,21 +10,29 @@ public class WhisperService
     private readonly IConfiguration _config;
     private readonly SemaphoreSlim _semaphore = new(1, 1);
     private readonly Lazy<HardwareInfo> _hardwareInfo;
+    private readonly Lazy<bool> _whisperXAvailable;
 
     public WhisperService(ILogger<WhisperService> logger, IConfiguration config)
     {
         _logger = logger;
         _config = config;
         _hardwareInfo = new Lazy<HardwareInfo>(DetectHardware);
+        _whisperXAvailable = new Lazy<bool>(CheckWhisperXAvailable);
     }
 
     public string WhisperBinary => _config["Whisper:BinaryPath"] ?? "/usr/local/bin/whisper-cli";
     public string ModelPath => _config["Whisper:ModelPath"] ?? "/usr/local/share/whisper/models/ggml-small.en.bin";
     public string ModelName => _config["Whisper:ModelName"] ?? "small.en";
     public int TimeoutMs => (_config.GetValue<int?>("Whisper:TimeoutSeconds") ?? 120) * 1000;
+    public int DiarizationTimeoutMs => (_config.GetValue<int?>("Whisper:DiarizationTimeoutSeconds") ?? 300) * 1000;
     public string DefaultPrompt => _config["Whisper:DefaultPrompt"] ?? "";
+    public string? HuggingFaceToken => _config["Whisper:HuggingFaceToken"];
+    public string WhisperXScript => _config["Whisper:WhisperXScript"]
+        ?? Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "scripts", "whisperx_transcribe.py");
+    public string PythonBinary => _config["Whisper:PythonBinary"] ?? "python3";
 
     public HardwareInfo Hardware => _hardwareInfo.Value;
+    public bool IsDiarizationAvailable => _whisperXAvailable.Value && !string.IsNullOrEmpty(HuggingFaceToken);
 
     public bool IsReady()
     {
@@ -40,6 +49,23 @@ public class WhisperService
         try
         {
             return await RunWhisperAsync(wavPath, prompt ?? DefaultPrompt);
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
+    }
+
+    /// <summary>
+    /// Transcribe with speaker diarization using WhisperX.
+    /// Returns a DiarizationResult with formatted text and speaker segments.
+    /// </summary>
+    public async Task<DiarizationResult?> TranscribeWithDiarizationAsync(string wavPath, string? prompt)
+    {
+        await _semaphore.WaitAsync();
+        try
+        {
+            return await RunWhisperXAsync(wavPath, prompt ?? DefaultPrompt);
         }
         finally
         {
@@ -113,6 +139,122 @@ public class WhisperService
             _logger.LogError(ex, "Error running whisper-cli");
             return null;
         }
+    }
+
+    private async Task<DiarizationResult?> RunWhisperXAsync(string wavPath, string prompt)
+    {
+        var scriptPath = Path.GetFullPath(WhisperXScript);
+        if (!File.Exists(scriptPath))
+        {
+            _logger.LogError("WhisperX script not found at {Path}", scriptPath);
+            return null;
+        }
+
+        var args = $"\"{scriptPath}\" \"{wavPath}\" --model \"{ModelName}\" --hf-token \"{HuggingFaceToken}\" --language en";
+        if (!string.IsNullOrEmpty(prompt))
+            args += $" --prompt \"{prompt}\"";
+
+        var startInfo = new ProcessStartInfo(PythonBinary, args)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = Path.GetDirectoryName(scriptPath) ?? Directory.GetCurrentDirectory()
+        };
+
+        try
+        {
+            using var proc = Process.Start(startInfo);
+            if (proc == null)
+            {
+                _logger.LogError("Failed to start WhisperX process");
+                return null;
+            }
+
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+            var stderrTask = proc.StandardError.ReadToEndAsync();
+
+            var exited = await Task.Run(() => proc.WaitForExit(DiarizationTimeoutMs));
+            if (!exited)
+            {
+                _logger.LogError("WhisperX timed out after {Timeout}s", DiarizationTimeoutMs / 1000);
+                proc.Kill(entireProcessTree: true);
+                return null;
+            }
+
+            var stdout = await stdoutTask;
+            var stderr = await stderrTask;
+
+            if (proc.ExitCode != 0)
+            {
+                _logger.LogError("WhisperX failed (exit {Code}).\nStderr: {Stderr}\nStdout: {Stdout}",
+                    proc.ExitCode, stderr, stdout);
+                return null;
+            }
+
+            if (string.IsNullOrWhiteSpace(stdout))
+            {
+                _logger.LogError("WhisperX produced no output.\nStderr: {Stderr}", stderr);
+                return null;
+            }
+
+            var json = JsonSerializer.Deserialize<JsonElement>(stdout);
+
+            if (json.TryGetProperty("error", out var errorProp))
+            {
+                _logger.LogError("WhisperX error: {Error}", errorProp.GetString());
+                return null;
+            }
+
+            var text = json.TryGetProperty("text", out var textProp) ? textProp.GetString() : null;
+            if (string.IsNullOrWhiteSpace(text)) return null;
+
+            var segments = new List<DiarizationSegment>();
+            if (json.TryGetProperty("segments", out var segArray))
+            {
+                foreach (var seg in segArray.EnumerateArray())
+                {
+                    segments.Add(new DiarizationSegment
+                    {
+                        Speaker = seg.TryGetProperty("speaker", out var sp) ? sp.GetString() ?? "Unknown" : "Unknown",
+                        Text = seg.TryGetProperty("text", out var tx) ? tx.GetString() ?? "" : "",
+                        Start = seg.TryGetProperty("start", out var st) ? st.GetDouble() : 0,
+                        End = seg.TryGetProperty("end", out var en) ? en.GetDouble() : 0,
+                    });
+                }
+            }
+
+            return new DiarizationResult { Text = text, Segments = segments };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error running WhisperX");
+            return null;
+        }
+    }
+
+    private bool CheckWhisperXAvailable()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(PythonBinary, "-c \"import whisperx; print('ok')\"")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi);
+            if (proc != null)
+            {
+                var output = proc.StandardOutput.ReadToEnd().Trim();
+                proc.WaitForExit(10000);
+                return proc.ExitCode == 0 && output == "ok";
+            }
+        }
+        catch { }
+        return false;
     }
 
     private HardwareInfo DetectHardware()
@@ -211,4 +353,18 @@ public class HardwareInfo
     public bool CudaAvailable { get; set; }
     public bool WhisperCudaEnabled { get; set; }
     public string AccelerationMode => WhisperCudaEnabled ? "GPU (CUDA)" : CudaAvailable ? "GPU available but not enabled" : "CPU";
+}
+
+public class DiarizationResult
+{
+    public string Text { get; set; } = "";
+    public List<DiarizationSegment> Segments { get; set; } = new();
+}
+
+public class DiarizationSegment
+{
+    public string Speaker { get; set; } = "Unknown";
+    public string Text { get; set; } = "";
+    public double Start { get; set; }
+    public double End { get; set; }
 }

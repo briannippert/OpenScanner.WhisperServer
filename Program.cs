@@ -28,7 +28,8 @@ app.MapGet("/health", (WhisperService whisper) =>
         acceleration = hw.AccelerationMode,
         cpu = hw.Cpu,
         gpu = hw.Gpu,
-        gpuMemoryMb = hw.GpuMemoryMb
+        gpuMemoryMb = hw.GpuMemoryMb,
+        diarizationAvailable = whisper.IsDiarizationAvailable
     });
 });
 
@@ -54,6 +55,8 @@ app.MapPost("/transcribe", async (HttpRequest request, WhisperService whisper, I
     }
 
     var prompt = form.TryGetValue("prompt", out var promptValues) ? promptValues.ToString() : null;
+    var diarize = form.TryGetValue("diarize", out var diarizeValues)
+        && string.Equals(diarizeValues.ToString(), "true", StringComparison.OrdinalIgnoreCase);
 
     // Save uploaded file to temp location
     var tempDir = Path.Combine(Path.GetTempPath(), "whisper-server");
@@ -69,10 +72,19 @@ app.MapPost("/transcribe", async (HttpRequest request, WhisperService whisper, I
             await file.CopyToAsync(stream);
         }
 
-        logger.LogInformation("Transcribing {FileName} ({Size} bytes)", file.FileName, file.Length);
+        logger.LogInformation("Transcribing {FileName} ({Size} bytes, diarize={Diarize})",
+            file.FileName, file.Length, diarize);
+
+        if (diarize && whisper.IsDiarizationAvailable)
+        {
+            var result = await whisper.TranscribeWithDiarizationAsync(tempPath, prompt);
+            if (result == null)
+                return Results.Ok(new { text = "", segments = Array.Empty<object>() });
+
+            return Results.Ok(new { text = result.Text, segments = result.Segments });
+        }
 
         var text = await whisper.TranscribeAsync(tempPath, prompt);
-
         return Results.Ok(new { text = text ?? "" });
     }
     catch (Exception ex)

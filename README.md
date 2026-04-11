@@ -92,7 +92,9 @@ Edit `appsettings.json` to point to your whisper.cpp installation (the installer
     "BinaryPath": "/path/to/whisper.cpp/build/bin/whisper-cli",
     "ModelPath": "/path/to/whisper.cpp/models/ggml-small.en.bin",
     "ModelName": "small.en",
-    "TimeoutSeconds": 120
+    "TimeoutSeconds": 120,
+    "DiarizationTimeoutSeconds": 300,
+    "HuggingFaceToken": ""
   }
 }
 ```
@@ -129,7 +131,7 @@ dotnet run --urls "http://0.0.0.0:8090"
 
 ### GET /health
 
-Returns the server status and model information.
+Returns the server status, model information, and hardware details.
 
 ```bash
 curl http://localhost:8090/health
@@ -141,7 +143,12 @@ Response:
   "status": "ok",
   "model": "small.en",
   "binaryFound": true,
-  "modelFound": true
+  "modelFound": true,
+  "acceleration": "GPU (CUDA)",
+  "cpu": "Intel Core i7-12700K",
+  "gpu": "NVIDIA GeForce RTX 3080",
+  "gpuMemoryMb": 10240,
+  "diarizationAvailable": true
 }
 ```
 
@@ -162,9 +169,32 @@ Response:
 }
 ```
 
+#### With Speaker Diarization
+
+When WhisperX is configured, add `diarize=true` to identify speakers:
+
+```bash
+curl -X POST http://localhost:8090/transcribe \
+  -F "file=@recording.wav" \
+  -F "prompt=Dispatch, Unit 1, 10-4, copy, over." \
+  -F "diarize=true"
+```
+
+Response:
+```json
+{
+  "text": "[Speaker 1]: Unit 1, respond code 3 to Main and First.\n[Speaker 2]: Copy, Unit 1 en route.",
+  "segments": [
+    { "speaker": "Speaker 1", "text": "Unit 1, respond code 3 to Main and First.", "start": 0.0, "end": 3.2 },
+    { "speaker": "Speaker 2", "text": "Copy, Unit 1 en route.", "start": 3.5, "end": 5.1 }
+  ]
+}
+```
+
 Parameters:
 - `file` (required): WAV audio file
-- `prompt` (optional): Context prompt to guide transcription accuracy. If omitted, the default radio-context prompt from config is used.
+- `prompt` (optional): Context prompt to guide transcription accuracy
+- `diarize` (optional): Set to `true` to enable speaker diarization (requires WhisperX)
 
 ## Updating
 
@@ -182,6 +212,51 @@ Re-run the installer to pull the latest code, rebuild, and restart:
 4. Set **Transcription Mode** to **Remote Server**
 5. Enter the server URL (e.g., `http://192.168.1.100:8090`)
 6. Click **Test** to verify connectivity
+7. (Optional) Enable **Speaker Diarization** if WhisperX is configured
+
+## Speaker Diarization (WhisperX)
+
+WhisperX adds speaker diarization -- identifying who is speaking in each part of a radio transmission.
+
+### Setup
+
+The installer will prompt you to set up WhisperX. You'll need:
+
+1. A [HuggingFace](https://huggingface.co) account
+2. A HuggingFace access token (create one at https://huggingface.co/settings/tokens)
+3. Accept the license for these models:
+   - https://huggingface.co/pyannote/speaker-diarization-3.1
+   - https://huggingface.co/pyannote/segmentation-3.0
+
+When the installer asks for your HuggingFace token, paste it in. This enables WhisperX in a Python virtual environment alongside the standard whisper.cpp installation.
+
+### Manual Setup
+
+If you want to set up WhisperX after the initial install:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install whisperx
+```
+
+Then add these to `appsettings.json` under the `Whisper` section:
+
+```json
+{
+  "Whisper": {
+    "HuggingFaceToken": "hf_your_token_here",
+    "DiarizationTimeoutSeconds": 300
+  }
+}
+```
+
+### How It Works
+
+When diarization is enabled in OpenScanner and the server has WhisperX available:
+- Transcription uses WhisperX instead of whisper-cli
+- WhisperX performs transcription, alignment, and speaker diarization
+- Results include speaker labels like `[Speaker 1]:` before each segment
+- The standard whisper-cli is used as fallback when diarization is not requested
 
 ## License
 
