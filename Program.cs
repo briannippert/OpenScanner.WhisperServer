@@ -18,12 +18,17 @@ app.UseCors();
 app.MapGet("/health", (WhisperService whisper) =>
 {
     var ready = whisper.IsReady();
+    var hw = whisper.Hardware;
     return Results.Ok(new
     {
         status = ready ? "ok" : "error",
         model = whisper.ModelName,
         binaryFound = File.Exists(whisper.WhisperBinary),
-        modelFound = File.Exists(whisper.ModelPath)
+        modelFound = File.Exists(whisper.ModelPath),
+        acceleration = hw.AccelerationMode,
+        cpu = hw.Cpu,
+        gpu = hw.Gpu,
+        gpuMemoryMb = hw.GpuMemoryMb
     });
 });
 

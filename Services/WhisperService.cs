@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace OpenScanner.WhisperServer.Services;
 
@@ -7,11 +8,13 @@ public class WhisperService
     private readonly ILogger<WhisperService> _logger;
     private readonly IConfiguration _config;
     private readonly SemaphoreSlim _semaphore = new(1, 1);
+    private readonly Lazy<HardwareInfo> _hardwareInfo;
 
     public WhisperService(ILogger<WhisperService> logger, IConfiguration config)
     {
         _logger = logger;
         _config = config;
+        _hardwareInfo = new Lazy<HardwareInfo>(DetectHardware);
     }
 
     public string WhisperBinary => _config["Whisper:BinaryPath"] ?? "/usr/local/bin/whisper-cli";
@@ -19,6 +22,8 @@ public class WhisperService
     public string ModelName => _config["Whisper:ModelName"] ?? "small.en";
     public int TimeoutMs => (_config.GetValue<int?>("Whisper:TimeoutSeconds") ?? 120) * 1000;
     public string DefaultPrompt => _config["Whisper:DefaultPrompt"] ?? "";
+
+    public HardwareInfo Hardware => _hardwareInfo.Value;
 
     public bool IsReady()
     {
@@ -109,4 +114,71 @@ public class WhisperService
             return null;
         }
     }
+
+    private HardwareInfo DetectHardware()
+    {
+        var info = new HardwareInfo
+        {
+            Cpu = GetCpuName(),
+        };
+
+        try
+        {
+            var psi = new ProcessStartInfo("nvidia-smi", "--query-gpu=name,memory.total --format=csv,noheader,nounits")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi);
+            if (proc != null)
+            {
+                var output = proc.StandardOutput.ReadToEnd().Trim();
+                proc.WaitForExit(3000);
+                if (proc.ExitCode == 0 && !string.IsNullOrEmpty(output))
+                {
+                    var parts = output.Split(',', 2);
+                    info.Gpu = parts[0].Trim();
+                    if (parts.Length > 1 && int.TryParse(parts[1].Trim(), out var mb))
+                        info.GpuMemoryMb = mb;
+                    info.CudaAvailable = true;
+                }
+            }
+        }
+        catch
+        {
+            // nvidia-smi not available
+        }
+
+        return info;
+    }
+
+    private static string GetCpuName()
+    {
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                var lines = File.ReadAllLines("/proc/cpuinfo");
+                var modelLine = lines.FirstOrDefault(l => l.StartsWith("model name", StringComparison.OrdinalIgnoreCase));
+                if (modelLine != null)
+                {
+                    var value = modelLine.Split(':', 2);
+                    if (value.Length == 2) return value[1].Trim();
+                }
+            }
+        }
+        catch { }
+        return RuntimeInformation.ProcessArchitecture.ToString();
+    }
+}
+
+public class HardwareInfo
+{
+    public string Cpu { get; set; } = "Unknown";
+    public string? Gpu { get; set; }
+    public int? GpuMemoryMb { get; set; }
+    public bool CudaAvailable { get; set; }
+    public string AccelerationMode => CudaAvailable ? "GPU (CUDA)" : "CPU";
 }
