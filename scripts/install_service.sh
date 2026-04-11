@@ -136,6 +136,15 @@ sudo apt-get update -qq || log_warn "apt-get update encountered errors. Attempti
 sudo apt-get install -y -qq git cmake build-essential ffmpeg jq > /dev/null
 log_success "Libraries installed."
 
+# Install NVIDIA CUDA toolkit if GPU is present but nvcc is missing
+if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+    if ! command -v nvcc &> /dev/null; then
+        log_info "NVIDIA GPU detected but CUDA toolkit not installed. Installing..."
+        sudo apt-get install -y -qq nvidia-cuda-toolkit > /dev/null
+        log_success "NVIDIA CUDA toolkit installed."
+    fi
+fi
+
 # ----------------------------------------------------------------
 # 5. Whisper Model Selection
 # ----------------------------------------------------------------
