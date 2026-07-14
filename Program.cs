@@ -2,7 +2,9 @@ using OpenScanner.WhisperServer.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddSingleton<WhisperService>();
+builder.Services.AddHttpClient();
+builder.Services.AddSingleton<WhisperServerPool>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<WhisperServerPool>());
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
@@ -15,27 +17,35 @@ var app = builder.Build();
 
 app.UseCors();
 
-app.MapGet("/health", (WhisperService whisper) =>
+app.MapGet("/health", (WhisperServerPool pool) =>
 {
-    var ready = whisper.IsReady();
-    var hw = whisper.Hardware;
+    var ready = pool.IsReady();
+    var hw = pool.Hardware;
     return Results.Ok(new
     {
         status = ready ? "ok" : "error",
-        model = whisper.ModelName,
-        binaryFound = File.Exists(whisper.WhisperBinary),
-        modelFound = File.Exists(whisper.ModelPath),
+        defaultModel = pool.DefaultModel,
+        binaryFound = pool.BinaryExists,
+        defaultModelFound = pool.DefaultModelExists,
+        loadedModels = pool.LoadedModels(),
         acceleration = hw.AccelerationMode,
         cpu = hw.Cpu,
         gpu = hw.Gpu,
-        gpuMemoryMb = hw.GpuMemoryMb,
-        diarizationAvailable = whisper.IsDiarizationAvailable
+        gpuMemoryMb = hw.GpuMemoryMb
     });
 });
 
-app.MapPost("/transcribe", async (HttpRequest request, WhisperService whisper, ILogger<Program> logger) =>
+app.MapGet("/models", (WhisperServerPool pool) =>
 {
-    if (!whisper.IsReady())
+    var models = pool.GetAvailableModels()
+        .Select(id => new { id, label = id })
+        .ToList();
+    return Results.Ok(new { models });
+});
+
+app.MapPost("/transcribe", async (HttpRequest request, WhisperServerPool pool, ILogger<Program> logger) =>
+{
+    if (!pool.IsReady())
     {
         return Results.Json(new { error = "Whisper is not configured. Check binary and model paths." },
             statusCode: 503);
@@ -55,10 +65,9 @@ app.MapPost("/transcribe", async (HttpRequest request, WhisperService whisper, I
     }
 
     var prompt = form.TryGetValue("prompt", out var promptValues) ? promptValues.ToString() : null;
-    var diarize = form.TryGetValue("diarize", out var diarizeValues)
-        && string.Equals(diarizeValues.ToString(), "true", StringComparison.OrdinalIgnoreCase);
+    var model = form.TryGetValue("model", out var modelValues) ? modelValues.ToString() : null;
 
-    // Save uploaded file to temp location
+    // Save uploaded file to temp location (expected: 16 kHz mono WAV from OpenScanner).
     var tempDir = Path.Combine(Path.GetTempPath(), "whisper-server");
     Directory.CreateDirectory(tempDir);
     var ext = Path.GetExtension(file.FileName);
@@ -72,19 +81,10 @@ app.MapPost("/transcribe", async (HttpRequest request, WhisperService whisper, I
             await file.CopyToAsync(stream);
         }
 
-        logger.LogInformation("Transcribing {FileName} ({Size} bytes, diarize={Diarize})",
-            file.FileName, file.Length, diarize);
+        logger.LogInformation("Transcribing {FileName} ({Size} bytes, model={Model})",
+            file.FileName, file.Length, string.IsNullOrWhiteSpace(model) ? pool.DefaultModel : model);
 
-        if (diarize && whisper.IsDiarizationAvailable)
-        {
-            var result = await whisper.TranscribeWithDiarizationAsync(tempPath, prompt);
-            if (result == null)
-                return Results.Ok(new { text = "", segments = Array.Empty<object>() });
-
-            return Results.Ok(new { text = result.Text, segments = result.Segments });
-        }
-
-        var text = await whisper.TranscribeAsync(tempPath, prompt);
+        var text = await pool.TranscribeAsync(tempPath, model, prompt, request.HttpContext.RequestAborted);
         return Results.Ok(new { text = text ?? "" });
     }
     catch (Exception ex)
