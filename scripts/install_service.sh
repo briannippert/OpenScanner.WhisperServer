@@ -263,8 +263,54 @@ fi
 cd "$PROJECT_ROOT"
 
 # ----------------------------------------------------------------
-# 7. Update appsettings.json with selected model and paths
+# 7. Size the resident-model pool to the GPU and selected model
 # ----------------------------------------------------------------
+log_step "Sizing model pool..."
+
+# Each resident whisper-server process holds a full copy of the model plus compute
+# buffers. Estimate per-instance VRAM from the model file size (weights ~1.35x on
+# GPU + a fixed buffer allowance), then fit as many process "slots" as the GPU has.
+MODEL_FILE="$WHISPER_DIR/models/ggml-$WHISPER_MODEL.bin"
+MODEL_MB=0
+if [ -f "$MODEL_FILE" ]; then
+    MODEL_MB=$(du -m "$MODEL_FILE" | cut -f1)
+fi
+PER_INSTANCE_MB=$(( MODEL_MB * 135 / 100 + 700 ))
+
+# Detect total VRAM (MB) on the primary GPU.
+VRAM_MB=0
+if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+    VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9')
+    [ -z "$VRAM_MB" ] && VRAM_MB=0
+fi
+
+# Only size against VRAM when we actually built with CUDA and have a reading.
+if [ -n "$CMAKE_EXTRA_ARGS" ] && [ "$VRAM_MB" -gt 0 ] && [ "$PER_INSTANCE_MB" -gt 0 ]; then
+    USE_GPU=true
+    # Leave headroom for the display/driver: 15% of VRAM, capped at 1500 MB.
+    RESERVE=$(( VRAM_MB * 15 / 100 )); [ "$RESERVE" -gt 1500 ] && RESERVE=1500
+    USABLE=$(( VRAM_MB - RESERVE ))
+    SLOTS=$(( USABLE / PER_INSTANCE_MB ))
+    [ "$SLOTS" -lt 1 ] && SLOTS=1
+
+    if [ "$SLOTS" -ge 2 ]; then INSTANCES=2; else INSTANCES=1; fi
+    MAXMODELS=$(( SLOTS / INSTANCES ))
+    [ "$MAXMODELS" -lt 1 ] && MAXMODELS=1
+    [ "$MAXMODELS" -gt 2 ] && MAXMODELS=2
+
+    log_info "GPU VRAM: ${VRAM_MB} MB (usable ~${USABLE} MB), est. ${PER_INSTANCE_MB} MB/instance for $WHISPER_MODEL"
+    if [ "$USABLE" -lt "$PER_INSTANCE_MB" ]; then
+        log_warn "Model may not fit in VRAM; it will still run but could fall back/slow down."
+    fi
+else
+    # CPU build (or no VRAM reading): one warm instance of one model. CPU inference
+    # already uses all cores, so extra instances mostly contend.
+    USE_GPU=false
+    INSTANCES=1
+    MAXMODELS=1
+    log_info "No CUDA GPU sizing available; using a single resident instance."
+fi
+
 log_step "Updating Configuration..."
 
 WHISPER_BIN="$WHISPER_DIR/build/bin/whisper-server"
@@ -274,14 +320,18 @@ UPDATED=$(jq \
     --arg bin "$WHISPER_BIN" \
     --arg modelsDir "$MODELS_DIR" \
     --arg defaultModel "$WHISPER_MODEL" \
-    '.Whisper.WhisperServerBinary = $bin | .Whisper.ModelsDir = $modelsDir | .Whisper.DefaultModel = $defaultModel' \
+    --argjson instances "$INSTANCES" \
+    --argjson maxModels "$MAXMODELS" \
+    --argjson useGpu "$USE_GPU" \
+    '.Whisper.WhisperServerBinary = $bin | .Whisper.ModelsDir = $modelsDir | .Whisper.DefaultModel = $defaultModel | .Whisper.InstancesPerModel = $instances | .Whisper.MaxResidentModels = $maxModels | .Whisper.UseGpu = $useGpu' \
     "$APPSETTINGS")
 echo "$UPDATED" > "$APPSETTINGS"
 
 log_success "Configuration updated:"
-log_info "  Binary:     $WHISPER_BIN"
-log_info "  Models dir: $MODELS_DIR"
-log_info "  Default:    $WHISPER_MODEL"
+log_info "  Binary:       $WHISPER_BIN"
+log_info "  Models dir:   $MODELS_DIR"
+log_info "  Default:      $WHISPER_MODEL"
+log_info "  Instances:    $INSTANCES per model  (max $MAXMODELS resident model(s), GPU=$USE_GPU)"
 
 if [ "$DEPS_ONLY" = true ]; then
     log_success "Dependencies installed. Skipping build and service installation (--deps-only)."
