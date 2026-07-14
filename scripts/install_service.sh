@@ -202,8 +202,12 @@ log_step "Checking Whisper.cpp..."
 
 WHISPER_DIR="$PROJECT_ROOT/whisper.cpp"
 
-if [ ! -d "$WHISPER_DIR" ]; then
-    log_info "Cloning whisper.cpp..."
+# Clone if the directory is missing OR incomplete (e.g. an empty placeholder dir
+# left in the repo, or a partial checkout with no CMakeLists.txt). Removing first
+# lets `git clone` succeed into what would otherwise be a non-empty directory.
+if [ ! -f "$WHISPER_DIR/CMakeLists.txt" ]; then
+    log_info "whisper.cpp missing or incomplete; cloning..."
+    rm -rf "$WHISPER_DIR"
     git clone https://github.com/ggerganov/whisper.cpp.git "$WHISPER_DIR"
 fi
 
