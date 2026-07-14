@@ -3,6 +3,10 @@ using OpenScanner.WhisperServer.Services;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddHttpClient();
+// Non-logging client for internal loopback calls to whisper-server: the health
+// poll during model startup would otherwise flood the log with expected
+// connection-refused messages while the child boots.
+builder.Services.AddHttpClient("whisper").RemoveAllLoggers();
 builder.Services.AddSingleton<WhisperServerPool>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<WhisperServerPool>());
 builder.Services.AddCors(options =>

@@ -155,7 +155,7 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
             if (!string.IsNullOrEmpty(effectivePrompt))
                 content.Add(new StringContent(effectivePrompt), "prompt");
 
-            var client = _httpClientFactory.CreateClient();
+            var client = _httpClientFactory.CreateClient("whisper");
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeoutCts.CancelAfter(InferenceTimeoutMs);
 
@@ -213,56 +213,103 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
     private async Task StartPoolAsync(ModelPool pool, CancellationToken ct)
     {
         var modelPath = ModelPath(pool.Model);
-        _logger.LogInformation("Starting {Count} whisper-server instance(s) for model '{Model}'", InstancesPerModel, pool.Model);
+        _logger.LogInformation("Starting {Count} whisper-server instance(s) for model '{Model}' ({ModelPath})",
+            InstancesPerModel, pool.Model, modelPath);
 
-        for (int i = 0; i < InstancesPerModel; i++)
+        var started = new List<WhisperInstance>();
+        try
         {
-            var port = AllocatePort();
-            var psi = new ProcessStartInfo(WhisperServerBinary)
+            for (int i = 0; i < InstancesPerModel; i++)
             {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            psi.ArgumentList.Add("--model"); psi.ArgumentList.Add(modelPath);
-            psi.ArgumentList.Add("--host"); psi.ArgumentList.Add("127.0.0.1");
-            psi.ArgumentList.Add("--port"); psi.ArgumentList.Add(port.ToString());
-            psi.ArgumentList.Add("-t"); psi.ArgumentList.Add(Threads.ToString());
-            if (!UseGpu) psi.ArgumentList.Add("-ng");
+                var port = AllocatePort();
+                var psi = new ProcessStartInfo(WhisperServerBinary)
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+                psi.ArgumentList.Add("--model"); psi.ArgumentList.Add(modelPath);
+                psi.ArgumentList.Add("--host"); psi.ArgumentList.Add("127.0.0.1");
+                psi.ArgumentList.Add("--port"); psi.ArgumentList.Add(port.ToString());
+                psi.ArgumentList.Add("-t"); psi.ArgumentList.Add(Threads.ToString());
+                if (!UseGpu) psi.ArgumentList.Add("-ng");
 
-            var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start whisper-server");
-            // Drain the pipes so the child never blocks writing to a full buffer.
-            proc.OutputDataReceived += (_, _) => { };
-            proc.ErrorDataReceived += (_, _) => { };
-            proc.BeginOutputReadLine();
-            proc.BeginErrorReadLine();
+                Process proc;
+                try
+                {
+                    proc = Process.Start(psi) ?? throw new InvalidOperationException("Process.Start returned null");
+                }
+                catch (Exception ex)
+                {
+                    FreePort(port);
+                    throw new InvalidOperationException(
+                        $"Failed to launch whisper-server binary '{WhisperServerBinary}': {ex.Message}", ex);
+                }
 
-            var instance = new WhisperInstance(proc, port, pool);
-            pool.Instances.Add(instance);
+                var instance = new WhisperInstance(proc, port, pool);
+                // Capture the child's stderr (bounded) so a startup failure is diagnosable;
+                // drain stdout so the pipe can't fill and block the child.
+                proc.ErrorDataReceived += (_, e) => { if (e.Data != null) instance.AppendStderr(e.Data); };
+                proc.OutputDataReceived += (_, _) => { };
+                proc.BeginErrorReadLine();
+                proc.BeginOutputReadLine();
 
-            await WaitForHealthAsync(port, ct);
-            _logger.LogInformation("whisper-server '{Model}' ready on port {Port} (pid {Pid})", pool.Model, port, proc.Id);
+                started.Add(instance);
+                pool.Instances.Add(instance);
+
+                await WaitForHealthAsync(instance, ct);
+                _logger.LogInformation("whisper-server '{Model}' ready on port {Port} (pid {Pid})", pool.Model, port, proc.Id);
+            }
+        }
+        catch
+        {
+            // Roll back everything started in this call so we don't leak ports/processes
+            // or leave dead instances in the pool for the round-robin to hand out.
+            foreach (var inst in started)
+            {
+                pool.Instances.Remove(inst);
+                try { if (!inst.Process.HasExited) inst.Process.Kill(entireProcessTree: true); }
+                catch { /* already gone */ }
+                FreePort(inst.Port);
+                inst.Process.Dispose();
+            }
+            throw;
         }
     }
 
-    private async Task WaitForHealthAsync(int port, CancellationToken ct)
+    private async Task WaitForHealthAsync(WhisperInstance instance, CancellationToken ct)
     {
-        var client = _httpClientFactory.CreateClient();
+        // Dedicated non-logging client so the expected connection-refused churn while the
+        // child boots doesn't flood the logs.
+        var client = _httpClientFactory.CreateClient("whisper");
+        var port = instance.Port;
         var deadline = Environment.TickCount64 + StartupTimeoutMs;
-        Exception? last = null;
         while (Environment.TickCount64 < deadline)
         {
             ct.ThrowIfCancellationRequested();
+
+            // Fail fast if the child already died (bad/oversized model, OOM, missing CUDA
+            // libs, port in use, ...) instead of polling a dead port for the full timeout.
+            if (instance.Process.HasExited)
+            {
+                throw new InvalidOperationException(
+                    $"whisper-server exited during startup on port {port} (exit code {instance.Process.ExitCode}). " +
+                    $"Last output:\n{instance.StderrTail()}");
+            }
+
             try
             {
                 using var resp = await client.GetAsync($"http://127.0.0.1:{port}/health", ct);
                 if (resp.IsSuccessStatusCode) return;
             }
-            catch (Exception ex) { last = ex; }
-            await Task.Delay(250, ct);
+            catch { /* connection refused while still booting — expected */ }
+
+            await Task.Delay(500, ct);
         }
-        throw new TimeoutException($"whisper-server on port {port} did not become ready within {StartupTimeoutMs / 1000}s", last);
+        throw new TimeoutException(
+            $"whisper-server on port {port} did not become ready within {StartupTimeoutMs / 1000}s. " +
+            $"Last output:\n{instance.StderrTail()}");
     }
 
     private async Task EnforceResidentLimitAsync(string keep)
@@ -415,11 +462,29 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
         public ModelPool Owner { get; }
         public int InFlight;
 
+        private readonly object _errLock = new();
+        private readonly Queue<string> _stderr = new();
+
         public WhisperInstance(Process process, int port, ModelPool owner)
         {
             Process = process;
             Port = port;
             Owner = owner;
+        }
+
+        // Keep a bounded tail of the child's stderr for diagnostics.
+        public void AppendStderr(string line)
+        {
+            lock (_errLock)
+            {
+                _stderr.Enqueue(line);
+                while (_stderr.Count > 40) _stderr.Dequeue();
+            }
+        }
+
+        public string StderrTail()
+        {
+            lock (_errLock) return _stderr.Count == 0 ? "(no output captured)" : string.Join("\n", _stderr);
         }
     }
 }
