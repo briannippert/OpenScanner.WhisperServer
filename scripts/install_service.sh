@@ -253,12 +253,40 @@ if [ ! -f "$WHISPER_DIR/build/bin/whisper-server" ]; then
     log_success "Whisper.cpp built."
 fi
 
-# Download model
-if [ ! -f "$WHISPER_DIR/models/ggml-$WHISPER_MODEL.bin" ]; then
+# Download model (and verify it isn't a truncated/corrupt partial download — an
+# incomplete .bin left by an interrupted download would otherwise be skipped
+# forever because the file "exists", and whisper-server would fail to load it).
+MODEL_BIN="$WHISPER_DIR/models/ggml-$WHISPER_MODEL.bin"
+
+download_model() {
     log_info "Downloading Whisper model ($WHISPER_MODEL)..."
-    cd "$WHISPER_DIR"
-    bash ./models/download-ggml-model.sh "$WHISPER_MODEL"
-    log_success "Whisper model downloaded."
+    ( cd "$WHISPER_DIR" && bash ./models/download-ggml-model.sh "$WHISPER_MODEL" )
+}
+
+verify_model() {
+    # Loading the model reads every tensor, so a truncated file fails here. Run on
+    # CPU (-ng) with a 1s decode so this is a fast integrity check, not a benchmark,
+    # and independent of available VRAM.
+    "$WHISPER_DIR/build/bin/whisper-cli" -m "$MODEL_BIN" -f "$WHISPER_DIR/samples/jfk.wav" \
+        -ng -nt -d 1000 > /dev/null 2>&1
+}
+
+[ ! -f "$MODEL_BIN" ] && download_model
+
+if [ -f "$WHISPER_DIR/build/bin/whisper-cli" ] && [ -f "$WHISPER_DIR/samples/jfk.wav" ]; then
+    log_info "Verifying model integrity..."
+    if ! verify_model; then
+        log_warn "Model failed to load (incomplete/corrupt download). Re-downloading..."
+        rm -f "$MODEL_BIN"
+        download_model
+        if ! verify_model; then
+            log_error "Model still fails to load after re-download. Check free disk space and network."
+            exit 1
+        fi
+    fi
+    log_success "Whisper model ready and verified."
+else
+    log_success "Whisper model downloaded (skipped load check: whisper-cli/sample unavailable)."
 fi
 cd "$PROJECT_ROOT"
 
